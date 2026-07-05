@@ -18,6 +18,8 @@ import os
 import time
 import json
 import requests
+import websocket
+from datetime import datetime, timezone
 from nostr.key import PrivateKey
 from nostr.event import Event, EventKind
 import hashlib
@@ -28,8 +30,7 @@ except Exception:
 
 # ============ CONFIGURATION ============
 NSEC = os.getenv("NOSTR_NSEC", "nsec1...")
-if NSEC == "nsec1...":
-    raise ValueError("Set your NSEC in the environment variable NOSTR_NSEC")
+TERMINAL_TASK_STATUSES = {"paused", "ended", "completed", "complete", "done", "closed", "expired", "canceled", "cancelled", "inactive", "archived", "failed"}
 
 # Use a requests.Session so we can capture Set-Cookie from the auth flow
 SES = requests.Session()
@@ -40,6 +41,11 @@ if PRESET_SESSION_COOKIE:
     SES.headers.update({"Cookie": PRESET_SESSION_COOKIE})
 
 AQSTR_BASE = "https://aqstr.com"
+REQUEST_TIMEOUT = 3
+MAX_REPLY_LENGTH = int(os.getenv("AQSTR_MAX_REPLY_LENGTH", "280"))
+MAX_QUOTE_LENGTH = int(os.getenv("AQSTR_MAX_QUOTE_LENGTH", "280"))
+REPLY_TEMPLATE = os.getenv("AQSTR_REPLY_TEMPLATE", "This stood out to me — {excerpt}")
+QUOTE_TEMPLATE = os.getenv("AQSTR_QUOTE_TEMPLATE", "Worth a look — {excerpt} nostr:{event_id}")
 RELAYS = [
     "wss://relay.damus.io",
     "wss://relay.primal.net",
@@ -60,6 +66,8 @@ ACTIONS = [
 
 # ============ HELPERS ============
 def get_private_key():
+    if not NSEC or NSEC == "nsec1...":
+        raise ValueError("Set your NSEC in the environment variable NOSTR_NSEC")
     return PrivateKey.from_nsec(NSEC)
 
 def sign_event(private_key, kind, content, tags, created_at=None):
@@ -89,7 +97,7 @@ def publish_event(event, relays=RELAYS):
         "relays": relays,
     }
     headers = {"Content-Type": "application/json"}
-    resp = SES.post(f"{AQSTR_BASE}/api/publish-nostr", json=payload, headers=headers)
+    resp = SES.post(f"{AQSTR_BASE}/api/publish-nostr", json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
     return resp.status_code == 200
 
 def complete_task(task_id, task_type, nostr_event_id, reply_content=None):
@@ -101,7 +109,13 @@ def complete_task(task_id, task_type, nostr_event_id, reply_content=None):
     if reply_content:
         payload["replyContent"] = reply_content
     headers = {"Content-Type": "application/json"}
-    resp = SES.post(f"{AQSTR_BASE}/api/task/complete", json=payload, headers=headers)
+    resp = SES.post(f"{AQSTR_BASE}/api/task/complete", json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+    if resp.status_code != 200:
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = resp.text[:500]
+        print(f"    completion endpoint returned {resp.status_code}: {detail}")
     return resp.status_code == 200
 
 # ============ FETCH DASHBOARD ============
@@ -151,14 +165,22 @@ def get_task_completion_map(task, task_completions):
 
 
 def has_reward_for_action(task, action):
-    reward_key = f"{action}Reward"
-    reward = task.get(reward_key, 0)
-    if reward in (None, ""):
-        return False
-    try:
-        return float(reward) > 0
-    except (TypeError, ValueError):
-        return False
+    reward_keys = []
+    if action == "repost_with_quote":
+        reward_keys = ["repostWithQuoteReward", "repost_with_quoteReward", f"{action}Reward"]
+    elif action == "reply":
+        reward_keys = ["replyReward", f"{action}Reward"]
+    else:
+        reward_keys = [f"{action}Reward"]
+    for reward_key in reward_keys:
+        reward = task.get(reward_key, 0)
+        if reward in (None, ""):
+            continue
+        try:
+            return float(reward) > 0
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 def count_pending_actions(task, task_completions):
@@ -168,6 +190,60 @@ def count_pending_actions(task, task_completions):
         for action in ACTIONS
         if not bool(completions.get(action, False)) and has_reward_for_action(task, action)
     )
+
+
+def parse_task_timestamp(task):
+    if not isinstance(task, dict):
+        return None
+    for key in ("createdAt", "created_at", "created", "timestamp", "startAt", "start_at", "startTime", "date", "publishedAt", "published_at", "updatedAt", "updated_at"):
+        value = task.get(key)
+        if value in (None, ""):
+            continue
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(int(value), tz=timezone.utc)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                continue
+            if text.isdigit():
+                return datetime.fromtimestamp(int(text), tz=timezone.utc)
+            normalized = text.replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+    return None
+
+
+def task_sort_key(task, task_completions=None):
+    timestamp = parse_task_timestamp(task)
+    pending_actions = count_pending_actions(task, task_completions) if task_completions is not None else 0
+    task_id = get_task_id(task) or ""
+    return (
+        timestamp is None,
+        timestamp or datetime.min.replace(tzinfo=timezone.utc),
+        pending_actions,
+        task_id,
+    )
+
+
+def sort_tasks_for_processing(tasks, task_completions=None):
+    if not isinstance(tasks, list):
+        return []
+    actionable_tasks = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        status = str(task.get("status") or task.get("taskStatus") or "").strip().lower()
+        if status in TERMINAL_TASK_STATUSES:
+            continue
+        actionable_tasks.append(task)
+    return sorted(actionable_tasks, key=lambda task: task_sort_key(task, task_completions))
 
 
 def _parse_json_object(text):
@@ -213,7 +289,7 @@ def fetch_task_details(task_id):
         return None
     url = f"{AQSTR_BASE}/task/{task_id}?_data=routes/task.$id"
     try:
-        resp = SES.get(url)
+        resp = SES.get(url, timeout=REQUEST_TIMEOUT)
     except Exception:
         return None
     if resp.status_code != 200:
@@ -303,6 +379,13 @@ def extract_task_eligibility(data):
 
 
 def task_is_eligible(task, task_eligibility):
+    if not isinstance(task, dict):
+        return False
+
+    status = str(task.get("status") or task.get("taskStatus") or "").strip().lower()
+    if status in TERMINAL_TASK_STATUSES:
+        return False
+
     task_id = task.get("id") or task.get("taskId")
     if task_id is None:
         return True
@@ -453,6 +536,98 @@ def resolve_event_kind(action_name):
     return fallback
 
 
+def fetch_event_by_id(event_id, timeout=5):
+    if not event_id:
+        return None
+
+    relay_urls = [
+        "wss://relay.damus.io",
+        "wss://relay.primal.net",
+        "wss://nos.lol",
+        "wss://relay.nostr.band",
+    ]
+
+    for relay_url in relay_urls:
+        try:
+            ws = websocket.create_connection(relay_url, timeout=min(timeout, REQUEST_TIMEOUT))
+            sub_id = f"aqstr-{int(time.time() * 1000)}"
+            ws.send(json.dumps(["REQ", sub_id, {"ids": [event_id], "kinds": [1], "limit": 1}]))
+            deadline = time.time() + min(timeout, REQUEST_TIMEOUT)
+            while time.time() < deadline:
+                try:
+                    raw_message = ws.recv()
+                except Exception:
+                    break
+                if not raw_message:
+                    break
+                try:
+                    payload = json.loads(raw_message)
+                except Exception:
+                    continue
+                if isinstance(payload, list) and len(payload) >= 3 and payload[0] == "EVENT":
+                    event = payload[2]
+                    if isinstance(event, dict) and event.get("id") == event_id:
+                        ws.close()
+                        return event
+                if isinstance(payload, list) and payload[0] == "EOSE":
+                    break
+            try:
+                ws.close()
+            except Exception:
+                pass
+        except Exception:
+            continue
+
+    return None
+
+
+def _extract_excerpt(content, max_length=140):
+    if not content:
+        return "a thoughtful post"
+    cleaned = " ".join(str(content).split())
+    if len(cleaned) <= max_length:
+        return cleaned
+    return cleaned[: max_length - 3].rstrip() + "..."
+
+
+def _clip_content(content, max_length):
+    if not content:
+        return ""
+    cleaned = " ".join(str(content).split())
+    if len(cleaned) <= max_length:
+        return cleaned
+    return cleaned[: max_length - 3].rstrip() + "..."
+
+
+def should_fetch_target_event_content(task):
+    if not isinstance(task, dict):
+        return False
+    return any(
+        has_reward_for_action(task, action)
+        for action in ("reply", "repost_with_quote")
+    )
+
+
+def build_reply_content(target_event, event_id):
+    if isinstance(target_event, dict):
+        content = str(target_event.get("content") or "").strip()
+    else:
+        content = str(target_event or "").strip()
+    excerpt = _extract_excerpt(content, max_length=120)
+    rendered = REPLY_TEMPLATE.format(excerpt=excerpt, event_id=event_id or "")
+    return _clip_content(rendered, MAX_REPLY_LENGTH)
+
+
+def build_quote_content(target_event, event_id):
+    if isinstance(target_event, dict):
+        content = str(target_event.get("content") or "").strip()
+    else:
+        content = str(target_event or "").strip()
+    excerpt = _extract_excerpt(content, max_length=140)
+    rendered = QUOTE_TEMPLATE.format(excerpt=excerpt, event_id=event_id or "")
+    return _clip_content(rendered, MAX_QUOTE_LENGTH)
+
+
 def process_task(task, completions, private_key):
     """
     Process one task: for each action not yet completed, perform it.
@@ -470,6 +645,10 @@ def process_task(task, completions, private_key):
     user_completions = completions.get(task_id, {})
     # If the task has a `userTasks` list, we could also parse that, but the
     # `taskCompletions` map is more reliable.
+
+    target_event = None
+    if target_event_id and should_fetch_target_event_content(task):
+        target_event = fetch_event_by_id(target_event_id)
 
     # Define actions with their configuration
     actions = {
@@ -493,7 +672,7 @@ def process_task(task, completions, private_key):
             "kind": resolve_event_kind("reply"),
             "reward": task.get("replyReward", 0),
             "completed": user_completions.get("reply", False),
-            "content": "Great track! 🎵",  # Make this dynamic if needed
+            "content": build_reply_content(target_event, target_event_id),
             "tags": [["e", target_event_id, "", "reply"], ["p", target_pubkey]],
             "task_type": "reply",
         },
@@ -501,7 +680,7 @@ def process_task(task, completions, private_key):
             "kind": resolve_event_kind("repost_with_quote"),
             "reward": task.get("repostWithQuoteReward", 0),
             "completed": user_completions.get("repost_with_quote", False),
-            "content": "Check out this awesome tune! nostr:note1...",  # Quote text
+            "content": build_quote_content(target_event, target_event_id),
             "tags": [["e", target_event_id, "", "quote"], ["p", target_pubkey]],
             "task_type": "repost_with_quote",
         },
@@ -541,15 +720,15 @@ def process_task(task, completions, private_key):
             continue
 
         # Mark complete
-        reply_content = cfg["content"] if action_name == "repost_with_quote" else None
+        reply_content = cfg["content"] if action_name in {"reply", "repost_with_quote"} else None
         if complete_task(task_id, cfg["task_type"], event.id, reply_content):
             print(f"  ✅ Completed {action_name} earned {cfg['reward']} sats")
             any_completed = True
         else:
             print(f"  ❌ Failed to mark {action_name} as complete")
 
-        # Polite delay to avoid rate-limiting
-        time.sleep(5)
+        # Short delay to avoid hammering the APIs while keeping the loop responsive.
+        time.sleep(0.5)
 
     return any_completed
 
@@ -586,6 +765,7 @@ def main():
         available_tasks = extract_available_tasks(data)
         task_completions = extract_task_completions(data)
         task_eligibility = extract_task_eligibility(data)
+        available_tasks = sort_tasks_for_processing(available_tasks, task_completions)
 
         print(f"📋 Found {len(available_tasks)} available tasks")
 
@@ -612,8 +792,10 @@ def main():
 
             eligible_tasks.append(task)
 
-        eligible_tasks.sort(key=lambda t: count_pending_actions(t, task_completions))
+        eligible_tasks = sort_tasks_for_processing(eligible_tasks, task_completions)
         print(f"✅ Found {len(eligible_tasks)} eligible tasks to process")
+
+        processed_any = False
 
         # Process each eligible task
         for task in eligible_tasks:
@@ -630,19 +812,24 @@ def main():
             try:
                 any_done = process_task(task, task_completions, private_key)
                 if any_done:
+                    processed_any = True
                     print(f"  ✅ Task {task_id} completed at least one action")
                 else:
                     print(f"  ⚠️ Task {task_id} had no actions to perform")
             except Exception as e:
                 print(f"  ❌ Error processing task {task_id}: {e}")
 
-            # Wait before the next task
-            time.sleep(10)
+            # Keep the loop moving quickly, but still avoid rate-limiting bursts.
+            time.sleep(1)
+
+        if not processed_any:
+            print("\n🛑 No new actions were completed in this pass. Exiting loop to avoid repeating work.")
+            break
 
         # After processing all eligible tasks, wait before refreshing the list
         # This gives the system time to update completions and for new tasks to appear.
-        print("\n⏳ All eligible tasks processed. Waiting 60 seconds before refresh...")
-        time.sleep(60)
+        print("\n⏳ All eligible tasks processed. Waiting 10 seconds before refresh...")
+        time.sleep(10)
 
 if __name__ == "__main__":
     main()
